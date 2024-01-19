@@ -3,6 +3,6 @@
 
 """Base module for dataset reader and writer."""
 
-from streaming.base.format.base.reader import FileInfo, Reader
+from streaming.base.format.base.reader import BaseReader, FileInfo, Reader
 
-__all__ = ['FileInfo', 'Reader']
+__all__ = ['FileInfo', 'Reader', 'BaseReader']

@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Union
 from streaming.base.array import Array
 from streaming.base.util import bytes_to_int
 
-__all__ = ['FileInfo', 'Reader', 'JointReader', 'SplitReader']
+__all__ = ['FileInfo', 'Reader', 'JointReader', 'SplitReader', 'BaseReader']
 
 
 @dataclass
@@ -28,7 +28,108 @@ class FileInfo(object):
     hashes: Dict[str, str]
 
 
-class Reader(Array, ABC):
+class BaseReader(Array, ABC):
+    """Base class to provide access to the samples of a shard.
+
+    Args:
+        samples (int): Number of samples in this shard.
+    """
+
+    def __init__(self, *, samples: int) -> None:
+        self.samples = samples
+
+    @abstractmethod
+    def is_raw_file_present(self) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
+    def set_up_local(self, listing: Dict[int, Set[str]], safe_keep_zip: Dict[int, bool]) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def evict(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_raw_size(self) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_zip_size(self) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_max_size(self) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_persistent_size(self, keep_zip: bool) -> int:
+        raise NotImplementedError
+
+    def validate(self, allow_unsafe_types: bool) -> None:
+        """Check whether this shard is acceptable to be part of some Stream.
+
+        Args:
+            allow_unsafe_types (bool): If a shard contains Pickle, which allows arbitrary code
+                execution during deserialization, whether to keep going if ``True`` or raise an
+                error if ``False``.
+        """
+        pass
+
+    @property
+    def size(self):
+        return self.samples
+
+    def __len__(self) -> int:
+        return self.samples
+
+    def get_item(self, idx: int) -> Dict[str, Any]:
+        """Get the sample at the index.
+
+        Args:
+            idx (int): Sample index.
+
+        Returns:
+            Dict[str, Any]: Sample dict.
+        """
+        data = self.get_sample_data(idx)
+        return self.decode_sample(data)
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        """Iterate over the samples of this shard.
+
+        Returns:
+            Iterator[Dict[str, Any]]: Iterator over samples.
+        """
+        for i in range(len(self)):
+            yield self[i]
+
+    @abstractmethod
+    def decode_sample(self, data: bytes) -> Dict[str, Any]:
+        """Decode a sample dict from bytes.
+
+        Args:
+            data (bytes): The sample encoded as bytes.
+
+        Returns:
+            Dict[str, Any]: Sample dict.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_sample_data(self, idx: int) -> bytes:
+        """Get the raw sample data at the index.
+
+        Args:
+            idx (int): Sample index.
+
+        Returns:
+            bytes: Sample data.
+        """
+        raise NotImplementedError
+
+
+class Reader(BaseReader):
     """Provides random access to the samples of a shard.
 
     Args:
@@ -53,6 +154,7 @@ class Reader(Array, ABC):
         size_limit: Optional[Union[int, str]],
     ) -> None:
 
+        super().__init__(samples=samples)
         if size_limit:
             if (isinstance(size_limit, str)):
                 size_limit = bytes_to_int(size_limit)
@@ -68,33 +170,6 @@ class Reader(Array, ABC):
         self.size_limit = size_limit
 
         self.file_pairs = []
-
-    def validate(self, allow_unsafe_types: bool) -> None:
-        """Check whether this shard is acceptable to be part of some Stream.
-
-        Args:
-            allow_unsafe_types (bool): If a shard contains Pickle, which allows arbitrary code
-                execution during deserialization, whether to keep going if ``True`` or raise an
-                error if ``False``.
-        """
-        pass
-
-    @property
-    def size(self):
-        """Get the number of samples in this shard.
-
-        Returns:
-            int: Sample count.
-        """
-        return self.samples
-
-    def __len__(self) -> int:
-        """Get the number of samples in this shard.
-
-        Returns:
-            int: Sample count.
-        """
-        return self.samples
 
     def _evict_raw(self) -> int:
         """Remove all raw files belonging to this shard.
@@ -283,50 +358,15 @@ class Reader(Array, ABC):
             size = self.get_raw_size()
         return size
 
-    @abstractmethod
-    def decode_sample(self, data: bytes) -> Dict[str, Any]:
-        """Decode a sample dict from bytes.
-
-        Args:
-            data (bytes): The sample encoded as bytes.
+    def is_raw_file_present(self) -> bool:
+        """Whether the raw file is present.
 
         Returns:
-            Dict[str, Any]: Sample dict.
+            bool: Whether the raw file is present.
         """
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_sample_data(self, idx: int) -> bytes:
-        """Get the raw sample data at the index.
-
-        Args:
-            idx (int): Sample index.
-
-        Returns:
-            bytes: Sample data.
-        """
-        raise NotImplementedError
-
-    def get_item(self, idx: int) -> Dict[str, Any]:
-        """Get the sample at the index.
-
-        Args:
-            idx (int): Sample index.
-
-        Returns:
-            Dict[str, Any]: Sample dict.
-        """
-        data = self.get_sample_data(idx)
-        return self.decode_sample(data)
-
-    def __iter__(self) -> Iterator[Dict[str, Any]]:
-        """Iterate over the samples of this shard.
-
-        Returns:
-            Iterator[Dict[str, Any]]: Iterator over samples.
-        """
-        for i in range(len(self)):
-            yield self[i]
+        raw_info, _ = self.file_pairs[0]  # Each file pair is present in the same way.
+        raw_filename = os.path.join(self.dirname, self.split, raw_info.basename)  # Find raw.
+        return os.path.isfile(raw_filename)
 
 
 class JointReader(Reader):

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+from abc import ABC, abstractmethod
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -23,7 +24,7 @@ from streaming.base.util import retry, wait_for_file_to_exist
 from streaming.base.world import World
 
 
-class Stream:
+class Base(ABC):
     """A dataset, or sub-dataset if mixing, from which we stream/cache samples.
 
     We initialize a StreamingDataset with one or more Streams. Streams may be resampled to achieve
@@ -90,8 +91,6 @@ class Stream:
 
     def __init__(self,
                  *,
-                 remote: Optional[str] = None,
-                 local: Optional[str] = None,
                  split: Optional[str] = None,
                  proportion: Optional[float] = None,
                  repeat: Optional[float] = None,
@@ -100,8 +99,6 @@ class Stream:
                  download_timeout: Optional[float] = None,
                  validate_hash: Optional[str] = None,
                  keep_zip: Optional[bool] = None) -> None:
-        self.remote = remote
-        self._local = local
         self.split = split or ''
 
         has_proportion = proportion is not None
@@ -143,54 +140,9 @@ class Stream:
 
         self.validate_hash = validate_hash
 
-        if local is None:
-            self.local = self._get_temporary_directory()
-            if get_local_rank() == 0:
-                if os.path.exists(self.local):
-                    raise ValueError(
-                        f'Could not create a temporary local directory {self.local} . Either ' +
-                        f'delete the directory or specify a unique local directory with the ' +
-                        f'`local` value.')
-                os.makedirs(self.local)
-            barrier()
-        else:
-            self.local = local
-
         self._keep_zip = keep_zip
         if keep_zip is not None:
             self.keep_zip = keep_zip
-            self.safe_keep_zip = self.keep_zip or self.remote in {None, self.local}
-
-    def _get_temporary_directory(self) -> str:
-        """Construct a path to a temporary directory based on remote and split."""
-        root = tempfile.gettempdir()
-        hash = ''
-        if self.remote is not None:
-            hash = hashlib.blake2s(self.remote.encode('utf-8'), digest_size=16).hexdigest()
-        return os.path.join(root, hash, self.split)
-
-    def apply_default(self, default: dict) -> None:
-        """Apply defaults, setting any unset fields.
-
-        We use pairs of (name, _name) in order to make type checking happy.
-
-        Args:
-            default (Self): Stream containing default values for all optional fields.
-        """
-        if not (self.remote or self._local):
-            raise ValueError('`remote` and/or `local` path must be provided')
-
-        if not self.split:
-            self.split = default['split'] or ''
-        if self._download_retry is None:
-            self.download_retry = default['download_retry']
-        if self._download_timeout is None:
-            self.download_timeout = default['download_timeout']
-        if self.validate_hash is None:
-            self.validate_hash = default['validate_hash'] or None
-        if self._keep_zip is None:
-            self.keep_zip = default['keep_zip']
-            self.safe_keep_zip = default['keep_zip'] or self.remote in {None, self.local}
 
     @classmethod
     def validate_weights(cls, streams: Sequence[Self]) -> Tuple[bool, bool]:
@@ -288,6 +240,196 @@ class Stream:
             stream.choose = choose
 
         return choose_per_epoch
+
+    @abstractmethod
+    def apply_default(self, default: dict) -> None:
+        """Apply defaults, setting any unset fields.
+
+        We use pairs of (name, _name) in order to make type checking happy.
+
+        Args:
+            default (Self): Stream containing default values for all optional fields.
+        """
+
+    @abstractmethod
+    def prepare_shard(self, shard: Reader) -> int:
+        """Ensure (download, validate, extract, etc.) that we have the given shard.
+
+        Args:
+            shard (Reader): Which shard.
+
+        Returns:
+            int: Change in cache usage.
+        """
+
+    @abstractmethod
+    def get_shards(self, world: World, allow_unsafe_types: bool) -> List[Reader]:
+        """Load this Stream's index, retrieving its shard readers.
+
+        Args:
+            world (World): Distributed context.
+            allow_unsafe_types (bool): If a shard contains Pickle, which allows arbitrary code
+                execution during deserialization, whether to keep going if ``True`` or raise an
+                error.
+
+        Returns:
+            `List[Reader]: Shard readers.
+        """
+
+    @abstractmethod
+    def set_up_local(self, shards: List[Reader], cache_usage_per_shard: NDArray[np.int64]) -> None:
+        """Bring a local directory into a consistent state, getting which shards are present.
+
+        Args:
+            shards (List[Reader]): List of this stream's shards.
+            cache_usage_per_shard (NDArray[np.int64]): Cache usage per shard of this stream.
+        """
+
+    @abstractmethod
+    def get_index_size(self) -> int:
+        """Get the size of the index file in bytes.
+
+        Returns:
+            int: Size in bytes.
+        """
+
+
+class Stream(Base):
+    """A dataset, or sub-dataset if mixing, from which we stream/cache samples.
+
+    We initialize a StreamingDataset with one or more Streams. Streams may be resampled to achieve
+    different mixtures of samples.
+
+    Stream init takes three kinds of arguments:
+
+    * At least one of ``remote`` and ``local`` must exist. If no ``remote``, the data must be
+      local. If no ``local``, we cache to a temp directory.
+
+      * ``remote``
+      * ``local``
+
+    * At most one of ``proportion``, ``repeat``, or ``choose`` may exist. If provided one of these,
+      we derive the rest. Note that ``proportion`` (relative) and ``repeat``/``choose`` (absolute)
+      are mutually incompatible -- you must entirely use one or the other (or neither) for all
+      sub-datasets. If none are provided for all streams and ``epoch_size`` is unspecified, then
+      each sample from each stream is seen once per epoch. If none are provided for all streams
+      and ``epoch_size`` is specified, then streams are sampled in proportion to their size.
+
+      * ``proportion``
+      * ``repeat``
+      * ``choose``
+
+    * The remaining arguments are optional knobs for controlling downloading behavior and default
+      to ``None``. If ``None``, they take a default value provided to or by the StreamingDataset
+      init.
+
+      * ``split``
+      * ``download_retry``
+      * ``download_timeout``
+      * ``validate_hash``
+      * ``keep_zip``
+
+    Args:
+        remote (str, optional): Remote path or directory to download the dataset from. If ``None``,
+            its data must exist locally. Defaults to ``None``.
+        local (str, optional): Local working directory to download shards to. This is where shards
+            are cached while they are being used. Uses a temp directory if not set. Defaults to
+            ``None``.
+        split (str, optional): Which dataset split to use, if any. If provided, we stream from/to
+            the ``split`` subdirs of  ``remote`` and ``local``. Defaults to ``None``.
+        proportion (float, optional): How much to upsample or downsample this sub-dataset, as the
+            proportion of the total combined dataset that consists of this sub-dataset. If
+            using proportions, all sub-datasets provided together to the StreamingDataset init must
+            define their proportions. The total combined number of samples is either the
+            StreamingDataset argument "epoch_size" if provided, or kept the same total size as the
+            underlying data if not. If provided, must be non-negative. Defaults to ``None``.
+        repeat (float, optional): How much to upsample or downsample this sub-dataset, as a
+            multipler on the number of samples. If provided, must be non-negative. Defaults to
+            ``None``.
+        choose (int, optional): How much to upsample or downsample this sub-dataset, as the exact
+            number of resulting samples. If provided, must be non-negative. Defaults to ``None``.
+        download_retry (int, optional): Number of download re-attempts before giving up. Defaults
+            to ``None``.
+        download_timeout (float, optional): Number of seconds to wait for a shard to download
+            before raising an exception. Defaults to ``None``.
+        validate_hash (str, optional): Optional hash or checksum algorithm to use to validate
+            shards. Defaults to ``None``.
+        keep_zip (bool, optional): Whether to keep or delete the compressed form when decompressing
+            downloaded shards. If ``False``, keep if and only if remote is local or no remote.
+            Defaults to ``None``.
+    """
+
+    def __init__(self,
+                 *,
+                 remote: Optional[str] = None,
+                 local: Optional[str] = None,
+                 split: Optional[str] = None,
+                 proportion: Optional[float] = None,
+                 repeat: Optional[float] = None,
+                 choose: Optional[int] = None,
+                 download_retry: Optional[int] = None,
+                 download_timeout: Optional[float] = None,
+                 validate_hash: Optional[str] = None,
+                 keep_zip: Optional[bool] = None) -> None:
+
+        super().__init__(split=split,
+                         proportion=proportion,
+                         repeat=repeat,
+                         choose=choose,
+                         download_retry=download_retry,
+                         download_timeout=download_timeout,
+                         validate_hash=validate_hash,
+                         keep_zip=keep_zip)
+        self.remote = remote
+        self._local = local
+
+        if local is None:
+            self.local = self._get_temporary_directory()
+            if get_local_rank() == 0:
+                if os.path.exists(self.local):
+                    raise ValueError(
+                        f'Could not create a temporary local directory {self.local} . Either ' +
+                        f'delete the directory or specify a unique local directory with the ' +
+                        f'`local` value.')
+                os.makedirs(self.local)
+            barrier()
+        else:
+            self.local = local
+
+        if keep_zip is not None:
+            self.keep_zip = keep_zip
+            self.safe_keep_zip = self.keep_zip or self.remote in {None, self.local}
+
+    def _get_temporary_directory(self) -> str:
+        """Construct a path to a temporary directory based on remote and split."""
+        root = tempfile.gettempdir()
+        hash = ''
+        if self.remote is not None:
+            hash = hashlib.blake2s(self.remote.encode('utf-8'), digest_size=16).hexdigest()
+        return os.path.join(root, hash, self.split)
+
+    def apply_default(self, default: dict) -> None:
+        """Apply defaults, setting any unset fields.
+
+        We use pairs of (name, _name) in order to make type checking happy.
+
+        Args:
+            default (Self): Stream containing default values for all optional fields.
+        """
+        if not (self.remote or self._local):
+            raise ValueError('`remote` and/or `local` path must be provided')
+
+        if not self.split:
+            self.split = default['split'] or ''
+        if self._download_retry is None:
+            self.download_retry = default['download_retry']
+        if self._download_timeout is None:
+            self.download_timeout = default['download_timeout']
+        if self.validate_hash is None:
+            self.validate_hash = default['validate_hash'] or None
+        if self._keep_zip is None:
+            self.keep_zip = default['keep_zip']
+            self.safe_keep_zip = default['keep_zip'] or self.remote in {None, self.local}
 
     def _download_file(self, from_basename: str, to_basename: Optional[str] = None) -> str:
         """Safely download a file from remote to local cache.
@@ -452,7 +594,7 @@ class Stream:
             else:
                 wait_for_file_to_exist(
                     filename, TICK, self.download_timeout,
-                    f'Index file {os.path.join(self.remote or "", self.split or "", basename)} ' +
+                    f"Index file {os.path.join(self.remote or '', self.split or '', basename)} " +
                     f'-> {filename} took too long to download. Either increase the ' +
                     f'`download_timeout` value or check the other traceback.')
 
@@ -465,8 +607,8 @@ class Stream:
 
         # Version check.
         if obj['version'] != 2:
-            raise ValueError(f'Unsupported streaming data version: {obj["version"]}. ' +
-                             f'Expected version 2.')
+            raise ValueError(f"Unsupported streaming data version: {obj['version']}. " +
+                             'Expected version 2.')
 
         # Initialize shard readers according to the loaded info.
         shards = []
@@ -477,6 +619,20 @@ class Stream:
 
         return shards
 
+    def get_listing(self) -> List[str]:
+        """List the cache directory (so that we hit the filesystem once).
+
+        Returns:
+            List[str]: List of filenames.
+        """
+        local_dirname = os.path.join(self.local, self.split)
+        listing = set()
+        for dirname, _, subfiles in os.walk(local_dirname):
+            for subfile in subfiles:
+                filename = os.path.join(dirname, subfile)
+                listing.add(filename)
+        return listing
+
     def set_up_local(self, shards: List[Reader], cache_usage_per_shard: NDArray[np.int64]) -> None:
         """Bring a local directory into a consistent state, getting which shards are present.
 
@@ -484,13 +640,7 @@ class Stream:
             shards (List[Reader]): List of this stream's shards.
             cache_usage_per_shard (NDArray[np.int64]): Cache usage per shard of this stream.
         """
-        # List the cache directory (so that we hit the filesystem once).
-        local_dirname = os.path.join(self.local, self.split)
-        listing = set()
-        for dirname, _, subfiles in os.walk(local_dirname):
-            for subfile in subfiles:
-                filename = os.path.join(dirname, subfile)
-                listing.add(filename)
+        listing = self.get_listing()
 
         # Determine which shards are present, making local dir consistent.
         for i, shard in enumerate(shards):
@@ -504,3 +654,19 @@ class Stream:
         """
         filename = os.path.join(self.local, self.split, get_index_basename())
         return os.stat(filename).st_size
+
+    def stream_local(self) -> str:
+        """Get the local directory to stream from.
+
+        Returns:
+            str: Local directory.
+        """
+        return os.path.abspath(os.path.join(self.local, self.split))
+
+    def stream_remote(self) -> Optional[str]:
+        """Get the remote directory to stream from.
+
+        Returns:
+            Optional[str]: Remote directory.
+        """
+        return os.path.join(self.remote, self.split) if self.remote is not None else None

@@ -24,6 +24,7 @@ from torch.utils.data import IterableDataset
 
 from streaming.base.array import Array
 from streaming.base.batching import generate_work
+from streaming.base.composable.stream import ComposableStream
 from streaming.base.constant import (BARRIER, BARRIER_FILELOCK, CACHE_FILELOCK, CACHE_USAGE,
                                      EPOCH_DATA, EPOCH_SHAPE, NEXT_EPOCH, RESUME,
                                      SHARD_ACCESS_TIMES, SHARD_STATES, TICK)
@@ -310,7 +311,7 @@ class StreamingDataset(Array, IterableDataset):
 
     def __init__(self,
                  *,
-                 streams: Optional[Sequence[Stream]] = None,
+                 streams: Optional[Sequence[Union[Stream, ComposableStream]]] = None,
                  remote: Optional[str] = None,
                  local: Optional[str] = None,
                  split: Optional[str] = None,
@@ -506,10 +507,16 @@ class StreamingDataset(Array, IterableDataset):
         self.length = ceil(self.epoch_size / world.num_ranks)
 
         # Register/lookup our shared memory prefix and filelock root directory.
-        streams_local = [os.path.abspath(os.path.join(x.local, x.split)) for x in streams]
-        streams_remote = [
-            os.path.join(x.remote, x.split) if x.remote is not None else None for x in streams
-        ]
+        streams_local = []
+        streams_remote = []
+        for stream in streams:
+            if isinstance(stream, Stream):
+                streams_local.append(stream.stream_local())
+                streams_remote.append(stream.stream_remote())
+            else:
+                streams_local.extend(stream.stream_local())
+                streams_remote.extend(stream.stream_remote())
+
         self._shm_prefix_int, self._locals_shm = get_shm_prefix(streams_local, streams_remote,
                                                                 world)
         self._filelock_root = os.path.join(os.path.sep, 'tmp', 'streaming')
@@ -1141,10 +1148,8 @@ class StreamingDataset(Array, IterableDataset):
             stream = self.streams[stream_id]
             shard = self.shards[shard_id]
 
-            # We may need to decompress the shard (if local dir just contains zips).
-            raw_info, _ = shard.file_pairs[0]  # Each file pair is present in the same way.
-            raw_filename = os.path.join(stream.local, stream.split, raw_info.basename)  # Find raw.
-            if not os.path.isfile(raw_filename):  # Is raw missing?
+            is_raw_file_present = shard.is_raw_file_present()
+            if not is_raw_file_present:  # Is raw missing?
                 self._shard_states[shard_id] = _ShardState.PREPARING  # Lock the shard.
                 lock.release()  # Unblock other workers.
                 delta = stream.prepare_shard(shard)  # Decompress and remove zip.
