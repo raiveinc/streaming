@@ -6,7 +6,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from numpy.typing import NDArray
-
+from streaming.base.format.base.reader import Reader
 from streaming.base.composable import ComposableReader
 from streaming.base.stream import Base, Stream
 from streaming.base.world import World
@@ -66,42 +66,15 @@ class ComposableStream(Base):
         for stream in self.streams.values():
             stream.apply_default(default)
 
-    def prepare_shard(self, composable_shard: ComposableReader) -> int:
-        delta = 0
-        for key, stream in self.streams.items():
-            shard = composable_shard.get_shard(key)
-            delta += stream.prepare_shard(shard)
-        return delta
+    # def prepare_shard(self, composable_shard: ComposableReader) -> int:
+    #     delta = 0
+    #     for key, stream in self.streams.items():
+    #         shard = composable_shard.get_shard(key)
+    #         delta += stream.prepare_shard(shard)
+    #     return delta
 
-    def get_shards(self, world: World, allow_unsafe_types: bool) -> List[ComposableReader]:
-        readers = []
-        composable_shards = []
-        number_of_shards = 0
-        for stream in self.streams.values():
-            shards = stream.get_shards(world, allow_unsafe_types)
-            composable_shards.append(shards)
-            new_number_of_shards = len(shards)
-            if number_of_shards != 0 and number_of_shards != new_number_of_shards:
-                raise ValueError(
-                    f'All shards should have the same length, but they have {number_of_shards} and {new_number_of_shards}'
-                )
-            number_of_shards = new_number_of_shards
-
-        for index in range(number_of_shards):
-            shard_dict = {}
-            samples = 0
-            for key, stream in self.streams.items():
-                shard = composable_shards[key][index]
-                shard_dict[key] = shard
-                new_samples = shard.samples
-                if samples != 0 and samples != new_samples:
-                    raise ValueError(
-                        f'All shards should have the same number of samples, but they have {samples} and {new_samples}'
-                    )
-                samples = new_samples
-            readers.append(ComposableReader(samples=samples, shard_dict=shard_dict))
-
-        return readers
+    def get_shards(self, world: World, allow_unsafe_types: bool,) -> list[Reader]:
+        return [stream.get_shards(world, allow_unsafe_types) for stream in self.streams.values()]
 
     def get_listing(self) -> Dict[int, List[str]]:
         listing = {}
@@ -115,13 +88,13 @@ class ComposableStream(Base):
             safe_keep_zip[key] = stream.safe_keep_zip
         return safe_keep_zip
 
-    def set_up_local(self, shards: List[ComposableReader],
-                     cache_usage_per_shard: NDArray[np.int64]) -> None:
-        composable_listing = self.get_listing()
-        composable_safe_keep_zip = self._get_safe_keep_zip()
-        for i, composable_shard in enumerate(shards):
-            cache_usage_per_shard[i] = composable_shard.set_up_local(composable_listing,
-                                                                     composable_safe_keep_zip)
+    # def set_up_local(self, shards: List[ComposableReader],
+    #                  cache_usage_per_shard: NDArray[np.int64]) -> None:
+    #     composable_listing = self.get_listing()
+    #     composable_safe_keep_zip = self._get_safe_keep_zip()
+    #     for i, composable_shard in enumerate(shards):
+    #         cache_usage_per_shard[i] = composable_shard.set_up_local(composable_listing,
+    #                                                                  composable_safe_keep_zip)
 
     def get_index_size(self) -> int:
         st_size = 0

@@ -33,7 +33,7 @@ from streaming.base.format import get_index_basename
 from streaming.base.sampling import get_sampling
 from streaming.base.shared import (SharedArray, SharedBarrier, SharedMemory, SharedScalar,
                                    _get_path, get_shm_prefix)
-from streaming.base.spanner import Spanner
+from streaming.base.spanner import Spanner, MegaSpanner
 from streaming.base.stream import Stream
 from streaming.base.util import bytes_to_int, number_abbrev_to_int
 from streaming.base.world import World
@@ -452,23 +452,46 @@ class StreamingDataset(Array, IterableDataset):
         # Download each stream's index, load their shards, and map streams <-> shards.
         self.num_samples = 0
         self.shards = []
+        self.canonical_shards = []
         stream_per_shard = []
         self.shard_offset_per_stream = np.zeros(self.num_streams, np.int64)
         self.shards_per_stream = np.zeros(self.num_streams, np.int64)
         self.sample_offset_per_stream = np.zeros(self.num_streams, np.int64)
         self.samples_per_stream = np.zeros(self.num_streams, np.int64)
+
+        is_mega_spanner = False
+        all_samples_per_shard = []
+
         for stream_id, stream in enumerate(self.streams):
             stream_shards = stream.get_shards(world, self.allow_unsafe_types)
-            num_stream_samples = sum(map(len, stream_shards))
+            if len(stream_shards) > 0 and isinstance(stream_shards[0], list):
+                # wow in mega-spanner case!
+                is_mega_spanner = True
+                flat_stream_shards = [reader for readers in stream_shards for reader in readers]
+                canonical_stream_shards = stream_shards[0]
+                samples_per_shard = [
+                    np.array([shard.samples for shard in readers], np.int64),
+                    for readers in stream_shards
+                ]
+                all_samples_per_shard.append(samples_per_shard)
+            else:
+                flat_stream_shards = stream_shards
+                canonical_stream_shards = stream_shards
+                all_samples_per_shard.append([
+                    np.array([shard.samples for shard in stream_shards], np.int64)
+                ])
+            num_stream_samples = sum(map(len, canonical_stream_shards))
             if not num_stream_samples:
                 index_filename = os.path.join(stream.local, stream.split, get_index_basename())
                 raise RuntimeError(f'Stream contains no samples: {index_filename}.')
-            stream_per_shard += [stream_id] * len(stream_shards)
+            stream_per_shard += [stream_id] * len(canonical_stream_shards)
+            
             self.shard_offset_per_stream[stream_id] = len(self.shards)
             self.shards_per_stream[stream_id] = len(stream_shards)
             self.sample_offset_per_stream[stream_id] = self.num_samples
             self.samples_per_stream[stream_id] = num_stream_samples
-            self.shards += stream_shards
+            self.shards += flat_stream_shards
+            self.canonical_shards += canonical_stream_shards
             self.num_samples += num_stream_samples
         self.stream_per_shard = np.array(stream_per_shard, np.int64)
         self.num_shards = len(self.shards)
@@ -494,9 +517,15 @@ class StreamingDataset(Array, IterableDataset):
                                  f'`cache_limit` as high as possible to avoid thrashing.')
 
         # Build the shard index (for partitioning and mapping samples to shards).
-        self.samples_per_shard = np.array([shard.samples for shard in self.shards], np.int64)
-        self.sample_offset_per_shard = self.samples_per_shard.cumsum() - self.samples_per_shard
-        self.spanner = Spanner(self.samples_per_shard)
+        self.samples_per_canonical_shard = np.array([shard.samples for shard in self.canonical_shards], np.int64)
+        self.sample_offset_per_canonical_shard = self.samples_per_canonical_shard.cumsum() - self.samples_per_canonical_shard
+        if is_mega_spanner:
+            self.spanner = MegaSpanner(
+                all_samples_per_shard,
+            )
+        else:
+            del all_samples_per_shard
+            self.spanner = Spanner(self.samples_per_canonical_shard)
 
         # Now that we know the number of underlying samples of each stream, derive each stream's
         # true proportion/repeat/choose, as well as the total epoch size.
@@ -850,7 +879,7 @@ class StreamingDataset(Array, IterableDataset):
             stream_shard_ids = stream_shard_offset + np.arange(num_stream_shards)
 
             # Calculate choose per stream shard.
-            samples_per_stream_shard = self.samples_per_shard[stream_shard_ids]
+            samples_per_stream_shard = self.samples_per_canonical_shard[stream_shard_ids]
             # the number of items to choose from each stream, obtained during initialization
             stream_choose = self.streams[stream_id].choose
             use_epoch = self.sampling_method == 'balanced'
@@ -875,7 +904,7 @@ class StreamingDataset(Array, IterableDataset):
                 shuffle_units.append(shard_shuffle_units)
 
                 # Calculate sample IDs of any full repeats.
-                shard_sample_offset = self.sample_offset_per_shard[shard_id]
+                shard_sample_offset = self.sample_offset_per_canonical_shard[shard_id]
                 num_full_repeats = shard_choose // shard_samples
                 if num_full_repeats:
                     full_repeat = shard_sample_offset + np.arange(shard_samples)

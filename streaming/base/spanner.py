@@ -59,3 +59,35 @@ class Spanner:
                 return shard, int(index - shard_start)
 
         raise RuntimeError('Internal error: shards were indexed incorrectly')
+
+
+class MegaSpanner:
+    def __init__(self, all_shard_sizes: list[list[NDArray[np.int64]]],
+                 dummy_shards: set[int], span_size: int = 1 << 10, ) -> None:
+        spanner_levels = max(len(sizes) for sizes in all_shard_sizes)
+        # spanner_size_sum = [sizes[0].sum() for sizes in all_shard_sizes]
+        #  if len(sizes) < spanner_level else [spanner_size_sum]
+        self._spanners = [
+            Spanner(
+                np.concatenate([sizes[spanner_level] for sizes in all_shard_sizes],
+                               axis=0),
+                span_size=span_size,
+            )
+            for spanner_level in range(spanner_levels)
+        ]
+        self._shard_offsets = [0] + [
+            sum(len(sizes[spanner_level]) for sizes in all_shard_sizes)
+            for spanner_level in range(spanner_levels)
+        ][:-1]
+        self._dummy_shards = dummy_shards
+
+    def __getitem__(self, index: int) -> Tuple[int, int]:
+        all_items = []
+        for spanner_level, spanner in enumerate(self._spanners):
+            shard_id, shard_sample_id = spanner[index]
+            true_shard_id = shard_id + self._shard_offsets[spanner_level]
+            if true_shard_id in self._dummy_shards:
+                continue
+            all_items.append((true_shard_id, shard_sample_id))
+        return all_items
+
