@@ -5,7 +5,7 @@
 
 from typing import Any, Dict, Optional
 
-from streaming.base.format.base import BaseReader, FileInfo, Reader
+from streaming.base.format.base import FileInfo, Reader
 from streaming.base.format.index import get_index_basename
 from streaming.base.format.json import JSONReader, JSONWriter
 from streaming.base.format.mds import MDSReader, MDSWriter
@@ -14,7 +14,7 @@ from streaming.base.format.xsv import (CSVReader, CSVWriter, TSVReader, TSVWrite
 
 __all__ = [
     'CSVWriter', 'FileInfo', 'get_index_basename', 'JSONWriter', 'MDSWriter', 'Reader',
-    'reader_from_json', 'TSVWriter', 'XSVWriter', 'BaseReader'
+    'reader_from_json', 'TSVWriter', 'XSVWriter'
 ]
 
 _readers = {

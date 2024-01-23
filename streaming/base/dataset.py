@@ -893,7 +893,6 @@ class StreamingDataset(Array, IterableDataset):
             # stream's shard offset in list of all shards from all streams
             stream_shard_offset = self.shard_offset_per_stream[stream_id]
             num_stream_shards = self.shards_per_stream[stream_id]
-            # Here we can get the group leader shards
             stream_shard_ids = stream_shard_offset + np.arange(num_stream_shards)
 
             # Calculate choose per stream shard.
@@ -1195,8 +1194,9 @@ class StreamingDataset(Array, IterableDataset):
             stream = self.streams[stream_id]
             shard = self.shards[shard_id]
 
-            is_raw_file_present = shard.is_raw_file_present()
-            if not is_raw_file_present:  # Is raw missing?
+            raw_info, _ = shard.file_pairs[0]  # Each file pair is present in the same way.
+            raw_filename = os.path.join(stream.local, stream.split, raw_info.basename)  # Find raw.
+            if not os.path.isfile(raw_filename):  # Is raw missing?
                 self._shard_states[shard_id] = _ShardState.PREPARING  # Lock the shard.
                 lock.release()  # Unblock other workers.
                 delta = stream.prepare_shard(shard)  # Decompress and remove zip.
