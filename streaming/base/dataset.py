@@ -411,6 +411,8 @@ class StreamingDataset(Array, IterableDataset):
         # Initialize torch dist ourselves, if necessary.
         destroy_dist = maybe_init_dist()
 
+        # Holds all flattened stream
+        all_streams = []
         # Initialize the Stream defaults and normalize to a list of Streams.
         if streams:
             default = {
@@ -423,6 +425,11 @@ class StreamingDataset(Array, IterableDataset):
                 'keep_zip': keep_zip,
             }
             for stream in streams:
+                if isinstance(stream, ComposableStream):
+                    all_streams += stream.list()
+                else:
+                    all_streams.append(stream)
+            for stream in all_streams:
                 stream.apply_default(default)
         else:
             default = Stream(remote=remote,
@@ -432,14 +439,7 @@ class StreamingDataset(Array, IterableDataset):
                              download_timeout=download_timeout,
                              validate_hash=validate_hash,
                              keep_zip=keep_zip)
-            streams = [default]
-
-        all_streams = []
-        for stream in streams:
-            if isinstance(stream, ComposableStream):
-                all_streams += stream.substream()
-            else:
-                all_streams.append(stream)
+            all_streams = streams = [default]
 
         # Validate the stream weighting scheme (relative or absolute) to catch errors before we go
         # to the trouble of loading them.
@@ -471,7 +471,7 @@ class StreamingDataset(Array, IterableDataset):
         sample_offset = 0
         for master_stream_id, master_stream in enumerate(streams):
             if isinstance(master_stream, ComposableStream):
-                grouped_stream = master_stream.substream()
+                grouped_stream = master_stream.list()
             else:
                 grouped_stream = [master_stream]
 
@@ -491,7 +491,9 @@ class StreamingDataset(Array, IterableDataset):
                 self.shards_per_stream[stream_id] = len(stream_shards)
                 self.samples_per_stream[stream_id] = num_stream_samples
                 self.shards += stream_shards
-                group_cum_sum = np.array([(sample_offset + shard.samples) for shard in stream_shards], np.int64).cumsum()
+                group_cum_sum = np.array(
+                    [(sample_offset + shard.samples) for shard in stream_shards],
+                    np.int64).cumsum()
                 if sample_offset == 0:
                     group_cum_sum = np.concatenate([np.zeros(1, np.int64), group_cum_sum])
                 self.sample_offset_per_shard += group_cum_sum.tolist()
@@ -504,7 +506,6 @@ class StreamingDataset(Array, IterableDataset):
             sample_offset += self.samples_per_stream[stream_id - 1]
 
             self.grouped_shards[master_stream_id] = grouped_shards
-
 
         self.sample_offset_per_shard = np.array(self.sample_offset_per_shard, np.int64)
         self.streams = np.array(self.streams, dtype=object)

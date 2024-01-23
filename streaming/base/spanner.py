@@ -62,7 +62,6 @@ class Spanner:
 
 
 class GroupSpanner:
-    # We can pass the total number of sample in order to gain some compute time
     def __init__(self,
                  group_shard_sizes: list[NDArray[np.int64]],
                  span_size: int = 1 << 10) -> None:
@@ -73,9 +72,7 @@ class GroupSpanner:
         self.group_sample_offest = np.concatenate(
             [np.zeros(1, np.int64), self.group_sample_bounds.cumsum()])
         self.num_samples = sum(self.group_sample_bounds)
-        # As there might not be many groups, this might be quite useless...
         self.global_group_spanner = Spanner(self.group_sample_bounds, span_size)
-        # Is this an abomination? Yes it is
         self.group_spanner = np.empty(len(group_shard_sizes), dtype=object)
         for group_id, group in enumerate(group_shard_sizes):
             self.group_spanner[group_id] = np.empty(len(group), dtype=object)
@@ -107,7 +104,6 @@ class GroupSpanner:
         for row_id, spanner in enumerate(group_spanners):
             shard_id, index_in_shard = spanner[spanner_index]
             absolute_shard_id = group_offset + shard_id + shard_offset
-            # TODO: If there is an ugly bug check the index in shard
             ret.append((absolute_shard_id, index_in_shard))
             group_offset += self.shards_per_group_per_row[group_id][row_id]
 

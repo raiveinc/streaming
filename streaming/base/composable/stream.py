@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 from typing import List, Optional
 
-
 from streaming.base.stream import Stream
 
 
@@ -39,22 +38,19 @@ class ComposableStream:
 
         self.streams = [
             Stream(remote=source.remote,
-                                       local=source.local,
-                                       split=split,
-                                       proportion=proportion,
-                                       repeat=repeat,
-                                       choose=choose,
-                                       download_retry=download_retry,
-                                       download_timeout=download_timeout,
-                                       validate_hash=validate_hash,
-                                       keep_zip=keep_zip) for source in sources
+                   local=source.local,
+                   split=split,
+                   proportion=proportion,
+                   repeat=repeat,
+                   choose=choose,
+                   download_retry=download_retry,
+                   download_timeout=download_timeout,
+                   validate_hash=validate_hash,
+                   keep_zip=keep_zip) for source in sources
         ]
 
-    def substream(self) -> list[Stream]:
+    def list(self) -> list[Stream]:
         return self.streams
-
-    def apply_default(self, default: dict) -> None:
-        [stream.apply_default(default) for stream in self.streams]
 
     def __len__(self) -> int:
         return len(self.streams)
