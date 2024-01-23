@@ -434,14 +434,21 @@ class StreamingDataset(Array, IterableDataset):
                              keep_zip=keep_zip)
             streams = [default]
 
+        all_streams = []
+        for stream in streams:
+            if isinstance(stream, ComposableStream):
+                all_streams += stream.substream()
+            else:
+                all_streams.append(stream)
+
         # Validate the stream weighting scheme (relative or absolute) to catch errors before we go
-    # to the trouble of loading them.
-        Stream.validate_weights(streams)
+        # to the trouble of loading them.
+        Stream.validate_weights(all_streams)
 
         # Set streams.
-        self.streams = streams
-        # Here we want to store all streams
-        self.num_streams = len(streams)
+        self.streams = []
+        self.num_streams = len(all_streams)
+        self.num_master_streams = len(streams)
 
         # Initialize the World context.
         #
@@ -453,39 +460,55 @@ class StreamingDataset(Array, IterableDataset):
         # Download each stream's index, load their shards, and map streams <-> shards.
         self.num_samples = 0
         self.shards = []
-        self.grouped_shards = np.empty(self.num_streams, dtype=object)
+        self.sample_offset_per_shard = []
+        self.grouped_shards = np.empty(self.num_master_streams, dtype=object)
         stream_per_shard = []
         self.shard_offset_per_stream = np.zeros(self.num_streams, np.int64)
         self.shards_per_stream = np.zeros(self.num_streams, np.int64)
-        self.group_shards_per_stream = np.zeros(self.num_streams, np.int64)
         self.samples_per_stream = np.zeros(self.num_streams, np.int64)
-        # Here we want to store all 'master' streams id
-        for stream_id, stream in enumerate(self.streams):
-            stream_shards = stream.get_shards(world, self.allow_unsafe_types)
-            if len(stream_shards) > 0 and isinstance(stream_shards[0], list):
-                grouped_shards = stream_shards
-                # First index serve as the number of samples in the stream
-                num_stream_samples = sum(map(len, stream_shards[0]))
-                stream_shards = [shard for sublist in stream_shards for shard in sublist]
+        self.master_stream_ids = np.zeros(self.num_master_streams, np.int64)
+        stream_id = 0
+        sample_offset = 0
+        for master_stream_id, master_stream in enumerate(streams):
+            if isinstance(master_stream, ComposableStream):
+                grouped_stream = master_stream.substream()
             else:
-                grouped_shards = [stream_shards]
+                grouped_stream = [master_stream]
+
+            grouped_shards = []
+            self.master_stream_ids[master_stream_id] = stream_id
+            for stream in grouped_stream:
+                stream_shards = stream.get_shards(world, self.allow_unsafe_types)
                 num_stream_samples = sum(map(len, stream_shards))
+                grouped_shards.append(stream_shards)
 
-            if not num_stream_samples:
-                index_filename = os.path.join(stream.local, stream.split, get_index_basename())
-                raise RuntimeError(f'Stream contains no samples: {index_filename}.')
-            
-            stream_per_shard += [stream_id] * len(stream_shards)
-            self.shard_offset_per_stream[stream_id] = len(self.shards)
-            self.shards_per_stream[stream_id] = len(stream_shards)
-            self.group_shards_per_stream[stream_id] = len(grouped_shards[0])
-            self.samples_per_stream[stream_id] = num_stream_samples
-            self.shards += stream_shards
+                if not num_stream_samples:
+                    index_filename = os.path.join(stream.local, stream.split, get_index_basename())
+                    raise RuntimeError(f'Stream contains no samples: {index_filename}.')
+                self.streams.append(stream)
+                stream_per_shard += [stream_id] * len(stream_shards)
+                self.shard_offset_per_stream[stream_id] = len(self.shards)
+                self.shards_per_stream[stream_id] = len(stream_shards)
+                self.samples_per_stream[stream_id] = num_stream_samples
+                self.shards += stream_shards
+                group_cum_sum = np.array([(sample_offset + shard.samples) for shard in stream_shards], np.int64).cumsum()
+                if sample_offset == 0:
+                    group_cum_sum = np.concatenate([np.zeros(1, np.int64), group_cum_sum])
+                self.sample_offset_per_shard += group_cum_sum.tolist()
+
+                self.stream_per_shard = np.array(stream_per_shard, np.int64)
+
+                stream_id += 1
+
             self.num_samples += num_stream_samples
-            self.grouped_shards[stream_id] = grouped_shards
-            self.stream_per_shard = np.array(stream_per_shard, np.int64)
-        self.num_shards = len(self.shards)
+            sample_offset += self.samples_per_stream[stream_id - 1]
 
+            self.grouped_shards[master_stream_id] = grouped_shards
+
+
+        self.sample_offset_per_shard = np.array(self.sample_offset_per_shard, np.int64)
+        self.streams = np.array(self.streams, dtype=object)
+        self.num_shards = len(self.shards)
 
         # Check that cache limit is possible.
         if self.cache_limit:
@@ -507,44 +530,37 @@ class StreamingDataset(Array, IterableDataset):
                                  f'(compressed) file size. Recommendation is to provide a ' +
                                  f'`cache_limit` as high as possible to avoid thrashing.')
 
-        self.sample_per_group_per_shard = np.empty(self.num_streams, dtype=object)
+        self.sample_per_group_per_shard = np.empty(self.num_master_streams, dtype=object)
 
-        # TODO: I want to puke
+        # TODO: This must be so slow...
         for stream_id, group in enumerate(self.grouped_shards):
             self.sample_per_group_per_shard[stream_id] = np.empty(len(group), dtype=object)
             for group_id, shard_list in enumerate(group):
-                self.sample_per_group_per_shard[stream_id][group_id] = np.empty(len(shard_list), dtype=np.int64)
+                self.sample_per_group_per_shard[stream_id][group_id] = np.empty(len(shard_list),
+                                                                                dtype=np.int64)
                 for shard_id, shard in enumerate(shard_list):
                     self.sample_per_group_per_shard[stream_id][group_id][shard_id] = shard.samples
 
         # Build the shard index (for partitioning and mapping samples to shards).
         self.spanner = GroupSpanner(self.sample_per_group_per_shard)
 
-
         self.samples_per_shard = np.array([shard.samples for shard in self.shards], np.int64)
-
-        self.sample_offset_per_shard = self.samples_per_shard.cumsum() - self.samples_per_shard
-
-
 
         # Now that we know the number of underlying samples of each stream, derive each stream's
         # true proportion/repeat/choose, as well as the total epoch size.
-        self.epoch_size = Stream.apply_weights(self.streams, self.samples_per_stream,
+        streams_to_weight = self.streams[self.master_stream_ids]
+        samples_per_stream = self.samples_per_stream[self.master_stream_ids]
+        self.epoch_size = Stream.apply_weights(streams_to_weight, samples_per_stream,
                                                epoch_size_value, self.shuffle_seed)
 
         # Length (__len__) is the resampled epoch size divided over the number of devices.
         self.length = ceil(self.epoch_size / world.num_ranks)
 
         # Register/lookup our shared memory prefix and filelock root directory.
-        streams_local = []
-        streams_remote = []
-        for stream in streams:
-            if isinstance(stream, Stream):
-                streams_local.append(stream.stream_local())
-                streams_remote.append(stream.stream_remote())
-            else:
-                streams_local.extend(stream.stream_local())
-                streams_remote.extend(stream.stream_remote())
+        streams_local = [os.path.abspath(os.path.join(x.local, x.split)) for x in self.streams]
+        streams_remote = [
+            os.path.join(x.remote, x.split) if x.remote is not None else None for x in self.streams
+        ]
 
         self._shm_prefix_int, self._locals_shm = get_shm_prefix(streams_local, streams_remote,
                                                                 world)
@@ -869,13 +885,14 @@ class StreamingDataset(Array, IterableDataset):
         shuffle_units = []
         sample_ids = []
 
-        resampling_streams = range(self.num_streams) if stream_id is None else [stream_id]
+        # Get master stream ids
+        resampling_streams = self.master_stream_ids if stream_id is None else [stream_id]
 
         # Iterate over each stream.
         for stream_id in resampling_streams:
             # stream's shard offset in list of all shards from all streams
             stream_shard_offset = self.shard_offset_per_stream[stream_id]
-            num_stream_shards = self.group_shards_per_stream[stream_id]
+            num_stream_shards = self.shards_per_stream[stream_id]
             # Here we can get the group leader shards
             stream_shard_ids = stream_shard_offset + np.arange(num_stream_shards)
 
@@ -905,7 +922,6 @@ class StreamingDataset(Array, IterableDataset):
                 shuffle_units.append(shard_shuffle_units)
 
                 # Calculate sample IDs of any full repeats.
-                # TODO: This is not correct, we need offset it by group and not only shards
                 shard_sample_offset = self.sample_offset_per_shard[shard_id]
                 num_full_repeats = shard_choose // shard_samples
                 if num_full_repeats:
@@ -1193,7 +1209,7 @@ class StreamingDataset(Array, IterableDataset):
             # Unknown state.
             lock.release()
             raise RuntimeError(f'Invalid shard state: {state}')
-        
+
     def get_sample(self, shard_id: int, shard_sample_id: int, retry: int) -> Any:
         sample = None
         errors = []
@@ -1252,7 +1268,6 @@ class StreamingDataset(Array, IterableDataset):
             raise RuntimeError('Background thread failed. Check other traceback.')
         # Locate the shard and sample offset within that shard where the sample lives.
         items = self.spanner[sample_id]
-        print(items)
         sample = {}
         for shard_id, shard_sample_id in items:
             sample.update(self.get_sample(shard_id, shard_sample_id, retry))
@@ -1458,7 +1473,6 @@ class StreamingDataset(Array, IterableDataset):
         # Also pre-increment the epoch counter.
         world = World()
         epoch, sample_in_epoch = self._resume_incr_epoch(world)
-
         # Get this worker's partition of samples to process.
         sample_ids = self._get_work(world, epoch, sample_in_epoch)
         if not len(sample_ids):  # Resumed at end of epoch, out of samples.

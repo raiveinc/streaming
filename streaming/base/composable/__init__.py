@@ -3,11 +3,9 @@
 
 """MosaicML Streaming Datasets for cloud-native model training."""
 
-from streaming.base.composable.reader import ComposableReader
 from streaming.base.composable.stream import ComposableStream, Source
 
 __all__ = [
-    'ComposableReader',
     'ComposableStream',
     'Source',
 ]

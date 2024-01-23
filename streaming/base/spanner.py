@@ -61,18 +61,20 @@ class Spanner:
         raise RuntimeError('Internal error: shards were indexed incorrectly')
 
 
-
 class GroupSpanner:
     # We can pass the total number of sample in order to gain some compute time
-    def __init__(self, group_shard_sizes: list[NDArray[np.int64]], span_size: int = 1 << 10) -> None:
+    def __init__(self,
+                 group_shard_sizes: list[NDArray[np.int64]],
+                 span_size: int = 1 << 10) -> None:
         self.group_shard_sizes = group_shard_sizes
         self.span_size = span_size
-        self.group_bounds = np.array([sum(shard_sizes[0]) for shard_sizes in group_shard_sizes], np.int64)
-        self.group_sample_offest = np.concatenate([np.zeros(1, np.int64), self.group_bounds.cumsum()])
-        print("GROUP SAMPLE OFFSET", self.group_sample_offest)
-        self.num_samples = sum(self.group_bounds)
+        self.group_sample_bounds = np.array([sum(shard_sizes[0]) for shard_sizes in group_shard_sizes],
+                                     np.int64)
+        self.group_sample_offest = np.concatenate(
+            [np.zeros(1, np.int64), self.group_sample_bounds.cumsum()])
+        self.num_samples = sum(self.group_sample_bounds)
         # As there might not be many groups, this might be quite useless...
-        self.global_group_spanner = Spanner(self.group_bounds, span_size)
+        self.global_group_spanner = Spanner(self.group_sample_bounds, span_size)
         # Is this an abomination? Yes it is
         self.group_spanner = np.empty(len(group_shard_sizes), dtype=object)
         for group_id, group in enumerate(group_shard_sizes):
@@ -80,19 +82,21 @@ class GroupSpanner:
             for shard_list_id, shard_list in enumerate(group):
                 self.group_spanner[group_id][shard_list_id] = Spanner(shard_list, span_size)
 
-
         # Contains the number of shards len
         self.shards_per_group = np.empty(len(group_shard_sizes), np.int64)
+        self.shards_per_group_per_row = np.empty(len(group_shard_sizes), object)
         for group_id, shard_sizes in enumerate(group_shard_sizes):
+            self.shards_per_group_per_row[group_id] = np.empty(len(shard_sizes), np.int64)
             total = 0
-            for shard_size in shard_sizes:
+            for row_id, shard_size in enumerate(shard_sizes):
+                self.shards_per_group_per_row[group_id][row_id] = len(shard_size)
                 total += len(shard_size)
             self.shards_per_group[group_id] = total
-        self.shards_offset_per_group = np.concatenate([np.zeros(1, np.int64), self.shards_per_group.cumsum()])
+        self.shards_offset_per_group = np.concatenate(
+            [np.zeros(1, np.int64), self.shards_per_group.cumsum()])
 
     def __getitem__(self, index: int) -> Tuple[int, int]:
         group_id, _ = self.global_group_spanner[index]
-        # TODO; This might be totally unoptimized as there is a few number of groups
         shard_offset = self.shards_offset_per_group[group_id]
         ret = []
         group_offset = 0
@@ -100,13 +104,14 @@ class GroupSpanner:
         sample_offset = self.group_sample_offest[group_id]
 
         spanner_index = index - sample_offset
-        for group_id, spanner in enumerate(group_spanners):
+        for row_id, spanner in enumerate(group_spanners):
             shard_id, index_in_shard = spanner[spanner_index]
             absolute_shard_id = group_offset + shard_id + shard_offset
             # TODO: If there is an ugly bug check the index in shard
             ret.append((absolute_shard_id, index_in_shard))
+            group_offset += self.shards_per_group_per_row[group_id][row_id]
+
 
         if len(ret) > 0:
             return ret
         raise RuntimeError('Internal error: shards were indexed incorrectly')
-

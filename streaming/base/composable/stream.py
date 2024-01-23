@@ -2,15 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-import numpy as np
-from numpy.typing import NDArray
 
-from streaming.base.format.base.reader import Reader
-from streaming.base.composable import ComposableReader
-from streaming.base.stream import Base, Stream
-from streaming.base.world import World
+from streaming.base.stream import Stream
 
 
 @dataclass
@@ -28,7 +23,8 @@ class Source(object):
     local: Optional[str] = None
 
 
-class ComposableStream(Stream):
+class ComposableStream:
+
     def __init__(self,
                  *,
                  sources: List[Source] = [],
@@ -41,17 +37,8 @@ class ComposableStream(Stream):
                  validate_hash: Optional[str] = None,
                  keep_zip: Optional[bool] = None) -> None:
 
-        super().__init__(split=split,
-                            proportion=proportion,
-                            repeat=repeat,
-                            choose=choose,
-                            download_retry=download_retry,
-                            download_timeout=download_timeout,
-                            validate_hash=validate_hash,
-                            keep_zip=keep_zip)
-        self.streams = {}
-        for key, source in enumerate(sources):
-            self.streams[key] = Stream(remote=source.remote,
+        self.streams = [
+            Stream(remote=source.remote,
                                        local=source.local,
                                        split=split,
                                        proportion=proportion,
@@ -60,49 +47,14 @@ class ComposableStream(Stream):
                                        download_retry=download_retry,
                                        download_timeout=download_timeout,
                                        validate_hash=validate_hash,
-                                       keep_zip=keep_zip)
+                                       keep_zip=keep_zip) for source in sources
+        ]
 
+    def substream(self) -> list[Stream]:
+        return self.streams
 
-    def get_listing(self) -> Dict[int, List[str]]:
-        listing = {}
-        for key, stream in self.streams.items():
-            listing[key] = stream.get_listing()
-        return listing
-
-    def _get_safe_keep_zip(self) -> Dict[int, bool]:
-        safe_keep_zip = {}
-        for key, stream in self.streams.items():
-            safe_keep_zip[key] = stream.safe_keep_zip
-        return safe_keep_zip
-
-    def set_up_local(self, shards: List[ComposableReader],
-                     cache_usage_per_shard: NDArray[np.int64]) -> None:
-        composable_listing = self.get_listing()
-        composable_safe_keep_zip = self._get_safe_keep_zip()
-        for i, composable_shard in enumerate(shards):
-            cache_usage_per_shard[i] = composable_shard.set_up_local(composable_listing,
-                                                                     composable_safe_keep_zip)
     def apply_default(self, default: dict) -> None:
-        for stream in self.streams.values():
-            stream.apply_default(default)
+        [stream.apply_default(default) for stream in self.streams]
 
-    def get_shards(self, world: World, allow_unsafe_types: bool) -> list[list[Reader]]:
-        return [stream.get_shards(world, allow_unsafe_types) for stream in self.streams.values()]
-
-    def get_index_size(self) -> int:
-        st_size = 0
-        for stream in self.streams.values():
-            st_size += stream.get_index_size()
-        return st_size
-
-    def stream_local(self) -> List[str]:
-        local = []
-        for stream in self.streams.values():
-            local.append(stream.stream_local())
-        return local
-
-    def stream_remote(self) -> List[Optional[str]]:
-        remote = []
-        for stream in self.streams.values():
-            remote.append(stream.stream_remote())
-        return remote
+    def __len__(self) -> int:
+        return len(self.streams)
