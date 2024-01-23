@@ -33,7 +33,7 @@ from streaming.base.format import get_index_basename
 from streaming.base.sampling import get_sampling
 from streaming.base.shared import (SharedArray, SharedBarrier, SharedMemory, SharedScalar,
                                    _get_path, get_shm_prefix)
-from streaming.base.spanner import Spanner
+from streaming.base.spanner import GroupSpanner
 from streaming.base.stream import Stream
 from streaming.base.util import bytes_to_int, number_abbrev_to_int
 from streaming.base.world import World
@@ -435,11 +435,12 @@ class StreamingDataset(Array, IterableDataset):
             streams = [default]
 
         # Validate the stream weighting scheme (relative or absolute) to catch errors before we go
-        # to the trouble of loading them.
+    # to the trouble of loading them.
         Stream.validate_weights(streams)
 
         # Set streams.
         self.streams = streams
+        # Here we want to store all streams
         self.num_streams = len(streams)
 
         # Initialize the World context.
@@ -452,26 +453,39 @@ class StreamingDataset(Array, IterableDataset):
         # Download each stream's index, load their shards, and map streams <-> shards.
         self.num_samples = 0
         self.shards = []
+        self.grouped_shards = np.empty(self.num_streams, dtype=object)
         stream_per_shard = []
         self.shard_offset_per_stream = np.zeros(self.num_streams, np.int64)
         self.shards_per_stream = np.zeros(self.num_streams, np.int64)
-        self.sample_offset_per_stream = np.zeros(self.num_streams, np.int64)
+        self.group_shards_per_stream = np.zeros(self.num_streams, np.int64)
         self.samples_per_stream = np.zeros(self.num_streams, np.int64)
+        # Here we want to store all 'master' streams id
         for stream_id, stream in enumerate(self.streams):
             stream_shards = stream.get_shards(world, self.allow_unsafe_types)
-            num_stream_samples = sum(map(len, stream_shards))
+            if len(stream_shards) > 0 and isinstance(stream_shards[0], list):
+                grouped_shards = stream_shards
+                # First index serve as the number of samples in the stream
+                num_stream_samples = sum(map(len, stream_shards[0]))
+                stream_shards = [shard for sublist in stream_shards for shard in sublist]
+            else:
+                grouped_shards = [stream_shards]
+                num_stream_samples = sum(map(len, stream_shards))
+
             if not num_stream_samples:
                 index_filename = os.path.join(stream.local, stream.split, get_index_basename())
                 raise RuntimeError(f'Stream contains no samples: {index_filename}.')
+            
             stream_per_shard += [stream_id] * len(stream_shards)
             self.shard_offset_per_stream[stream_id] = len(self.shards)
             self.shards_per_stream[stream_id] = len(stream_shards)
-            self.sample_offset_per_stream[stream_id] = self.num_samples
+            self.group_shards_per_stream[stream_id] = len(grouped_shards[0])
             self.samples_per_stream[stream_id] = num_stream_samples
             self.shards += stream_shards
             self.num_samples += num_stream_samples
-        self.stream_per_shard = np.array(stream_per_shard, np.int64)
+            self.grouped_shards[stream_id] = grouped_shards
+            self.stream_per_shard = np.array(stream_per_shard, np.int64)
         self.num_shards = len(self.shards)
+
 
         # Check that cache limit is possible.
         if self.cache_limit:
@@ -493,10 +507,25 @@ class StreamingDataset(Array, IterableDataset):
                                  f'(compressed) file size. Recommendation is to provide a ' +
                                  f'`cache_limit` as high as possible to avoid thrashing.')
 
+        self.sample_per_group_per_shard = np.empty(self.num_streams, dtype=object)
+
+        # TODO: I want to puke
+        for stream_id, group in enumerate(self.grouped_shards):
+            self.sample_per_group_per_shard[stream_id] = np.empty(len(group), dtype=object)
+            for group_id, shard_list in enumerate(group):
+                self.sample_per_group_per_shard[stream_id][group_id] = np.empty(len(shard_list), dtype=np.int64)
+                for shard_id, shard in enumerate(shard_list):
+                    self.sample_per_group_per_shard[stream_id][group_id][shard_id] = shard.samples
+
         # Build the shard index (for partitioning and mapping samples to shards).
+        self.spanner = GroupSpanner(self.sample_per_group_per_shard)
+
+
         self.samples_per_shard = np.array([shard.samples for shard in self.shards], np.int64)
+
         self.sample_offset_per_shard = self.samples_per_shard.cumsum() - self.samples_per_shard
-        self.spanner = Spanner(self.samples_per_shard)
+
+
 
         # Now that we know the number of underlying samples of each stream, derive each stream's
         # true proportion/repeat/choose, as well as the total epoch size.
@@ -846,7 +875,8 @@ class StreamingDataset(Array, IterableDataset):
         for stream_id in resampling_streams:
             # stream's shard offset in list of all shards from all streams
             stream_shard_offset = self.shard_offset_per_stream[stream_id]
-            num_stream_shards = self.shards_per_stream[stream_id]
+            num_stream_shards = self.group_shards_per_stream[stream_id]
+            # Here we can get the group leader shards
             stream_shard_ids = stream_shard_offset + np.arange(num_stream_shards)
 
             # Calculate choose per stream shard.
@@ -875,6 +905,7 @@ class StreamingDataset(Array, IterableDataset):
                 shuffle_units.append(shard_shuffle_units)
 
                 # Calculate sample IDs of any full repeats.
+                # TODO: This is not correct, we need offset it by group and not only shards
                 shard_sample_offset = self.sample_offset_per_shard[shard_id]
                 num_full_repeats = shard_choose // shard_samples
                 if num_full_repeats:
@@ -1162,28 +1193,11 @@ class StreamingDataset(Array, IterableDataset):
             # Unknown state.
             lock.release()
             raise RuntimeError(f'Invalid shard state: {state}')
-
-    def get_item(self, sample_id: int, retry: int = 7) -> Any:
-        """Get sample by global index, blocking to download its shard if not present.
-
-        Args:
-            sample_id (int): Sample index.
-            retry (int): Maximum number of times to download its shard before giving up. In the
-                edge case of a shard being evicted before sample access, you will have to
-                re-download it. Defaults to ``7``.
-
-        Returns:
-            Dict[str, Any]: Mapping of column name to column data.
-        """
-        # Background thread crashed, terminate the main process
-        if hasattr(self, '_event') and self._event.is_set():
-            raise RuntimeError('Background thread failed. Check other traceback.')
-        # Locate the shard and sample offset within that shard where the sample lives.
-        shard_id, shard_sample_id = self.spanner[sample_id]
-        shard = self.shards[shard_id]
-
+        
+    def get_sample(self, shard_id: int, shard_sample_id: int, retry: int) -> Any:
         sample = None
         errors = []
+        shard = self.shards[shard_id]
         for _ in range(1 + retry):
             try:
                 # Shortcut path: just assume the shard is present. Using exceptions as control flow
@@ -1219,6 +1233,29 @@ class StreamingDataset(Array, IterableDataset):
                                    f'remote location or have you deleted the shard file from ' +
                                    f'the local directory?')
 
+        return sample
+
+    def get_item(self, sample_id: int, retry: int = 7) -> Any:
+        """Get sample by global index, blocking to download its shard if not present.
+
+        Args:
+            sample_id (int): Sample index.
+            retry (int): Maximum number of times to download its shard before giving up. In the
+                edge case of a shard being evicted before sample access, you will have to
+                re-download it. Defaults to ``7``.
+
+        Returns:
+            Dict[str, Any]: Mapping of column name to column data.
+        """
+        # Background thread crashed, terminate the main process
+        if hasattr(self, '_event') and self._event.is_set():
+            raise RuntimeError('Background thread failed. Check other traceback.')
+        # Locate the shard and sample offset within that shard where the sample lives.
+        items = self.spanner[sample_id]
+        print(items)
+        sample = {}
+        for shard_id, shard_sample_id in items:
+            sample.update(self.get_sample(shard_id, shard_sample_id, retry))
         return sample
 
     def on_exception(self, future: Future) -> None:
@@ -1282,8 +1319,9 @@ class StreamingDataset(Array, IterableDataset):
                 continue
 
             # Download and decompress the shard for this sample, if not already done.
-            shard_id, _ = self.spanner[sample_id]
-            self.prepare_shard(shard_id, False)
+            items = self.spanner[sample_id]
+            for shard_id, _ in items:
+                self.prepare_shard(shard_id, False)
 
             # Step forward one sample.
             it.prepare_index += 1
@@ -1334,17 +1372,17 @@ class StreamingDataset(Array, IterableDataset):
                 continue
 
             # Wait for the shard for this sample to be downloaded and decompressed, if not already.
-            shard_id, _ = self.spanner[sample_id]
-            # During cold shard eviction, shard state might go in the reverse direction. If a shard
-            # is missing while fetching a sample, download it.
-            if self._shard_states[shard_id] == _ShardState.REMOTE:
-                self.prepare_shard(shard_id, False)
-            # Wait for a shard file to download completely.
-            while self._shard_states[shard_id] != _ShardState.LOCAL:
-                # Background thread or a main process crashed, terminate this thread.
-                if self._event.is_set():
-                    break
-                sleep(TICK)
+            items = self.spanner[sample_id]
+            for shard_id, _ in items:
+                # If the shard is missing, download it.
+                if self._shard_states[shard_id] == _ShardState.REMOTE:
+                    self.prepare_shard(shard_id, False)
+                # Wait for a shard file to download completely.
+                while self._shard_states[shard_id] != _ShardState.LOCAL:
+                    # Background thread or a main process crashed, terminate this thread.
+                    if self._event.is_set():
+                        break
+                    sleep(TICK)
 
             # Step forward one sample.
             it.ready_index += 1
