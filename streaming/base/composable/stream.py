@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from typing import List, Optional
-
+import numpy as np
 from streaming.base.stream import Stream
 
 
@@ -34,7 +34,9 @@ class ComposableStream:
                  download_retry: Optional[int] = None,
                  download_timeout: Optional[float] = None,
                  validate_hash: Optional[str] = None,
-                 keep_zip: Optional[bool] = None) -> None:
+                 keep_zip: Optional[bool] = None,
+                 index_mask: Optional[np.ndarray] = None,
+                 ) -> None:
 
         self.streams = [
             Stream(remote=source.remote,
@@ -46,7 +48,9 @@ class ComposableStream:
                    download_retry=download_retry,
                    download_timeout=download_timeout,
                    validate_hash=validate_hash,
-                   keep_zip=keep_zip) for source in sources
+                   keep_zip=keep_zip,
+                   index_mask=index_mask,
+                   ) for source in sources
         ]
 
     def list(self) -> list[Stream]:
