@@ -88,20 +88,21 @@ class Stream:
             Defaults to ``None``.
     """
 
-    def __init__(self,
-                 *,
-                 remote: Optional[str] = None,
-                 local: Optional[str] = None,
-                 split: Optional[str] = None,
-                 proportion: Optional[float] = None,
-                 repeat: Optional[float] = None,
-                 choose: Optional[int] = None,
-                 download_retry: Optional[int] = None,
-                 download_timeout: Optional[float] = None,
-                 validate_hash: Optional[str] = None,
-                 keep_zip: Optional[bool] = None,
-                 index_mask: Optional[np.ndarray] = None,
-                 ) -> None:
+    def __init__(
+        self,
+        *,
+        remote: Optional[str] = None,
+        local: Optional[str] = None,
+        split: Optional[str] = None,
+        proportion: Optional[float] = None,
+        repeat: Optional[float] = None,
+        choose: Optional[int] = None,
+        download_retry: Optional[int] = None,
+        download_timeout: Optional[float] = None,
+        validate_hash: Optional[str] = None,
+        keep_zip: Optional[bool] = None,
+        index_mask: Optional[np.ndarray] = None,
+    ) -> None:
         self.remote = remote
         self.index_mask = index_mask
         self._local = local
@@ -482,7 +483,8 @@ class Stream:
                 shard_size = shard.size
                 shard.apply_index_mask(index_mask[offset:offset + shard_size])
                 offset += shard_size
-            shards.append(shard)
+            if shard.size > 0:
+                shards.append(shard)
 
         return shards
 
