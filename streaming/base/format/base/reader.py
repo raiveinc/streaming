@@ -7,7 +7,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Set, Union
-
+import numpy as np
 from streaming.base.array import Array
 from streaming.base.util import bytes_to_int
 
@@ -65,6 +65,8 @@ class Reader(Array, ABC):
         self.compression = compression
         self.hashes = hashes
         self.samples = samples
+        self._indices = None
+        self._original_samples = None
         self.size_limit = size_limit
 
         self.file_pairs = []
@@ -78,6 +80,15 @@ class Reader(Array, ABC):
                 error if ``False``.
         """
         pass
+
+    def apply_index_mask(self, mask: np.ndarray):
+        if np.all(mask):
+            return
+        if self._indices is not None:
+            self.samples = self._original_samples
+        self._indices = np.flatnonzero(mask)
+        self._original_samples = self.samples
+        self.samples = len(self._indices)
 
     @property
     def size(self):
@@ -316,7 +327,11 @@ class Reader(Array, ABC):
         Returns:
             Dict[str, Any]: Sample dict.
         """
-        data = self.get_sample_data(idx)
+        if self._indices is not None:
+            raw_idx = self._indices[idx]
+        else:
+            raw_idx = idx
+        data = self.get_sample_data(raw_idx)
         return self.decode_sample(data)
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:

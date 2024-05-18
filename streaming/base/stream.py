@@ -88,19 +88,23 @@ class Stream:
             Defaults to ``None``.
     """
 
-    def __init__(self,
-                 *,
-                 remote: Optional[str] = None,
-                 local: Optional[str] = None,
-                 split: Optional[str] = None,
-                 proportion: Optional[float] = None,
-                 repeat: Optional[float] = None,
-                 choose: Optional[int] = None,
-                 download_retry: Optional[int] = None,
-                 download_timeout: Optional[float] = None,
-                 validate_hash: Optional[str] = None,
-                 keep_zip: Optional[bool] = None) -> None:
+    def __init__(
+        self,
+        *,
+        remote: Optional[str] = None,
+        local: Optional[str] = None,
+        split: Optional[str] = None,
+        proportion: Optional[float] = None,
+        repeat: Optional[float] = None,
+        choose: Optional[int] = None,
+        download_retry: Optional[int] = None,
+        download_timeout: Optional[float] = None,
+        validate_hash: Optional[str] = None,
+        keep_zip: Optional[bool] = None,
+        index_mask: Optional[np.ndarray] = None,
+    ) -> None:
         self.remote = remote
+        self.index_mask = index_mask
         self._local = local
         self.split = split or ''
 
@@ -470,10 +474,17 @@ class Stream:
 
         # Initialize shard readers according to the loaded info.
         shards = []
+        index_mask = self.index_mask
+        offset = 0
         for info in obj['shards']:
             shard = reader_from_json(self.local, self.split, info)
             shard.validate(allow_unsafe_types)
-            shards.append(shard)
+            if index_mask is not None:
+                shard_size = shard.size
+                shard.apply_index_mask(index_mask[offset:offset + shard_size])
+                offset += shard_size
+            if shard.size > 0:
+                shards.append(shard)
 
         return shards
 
