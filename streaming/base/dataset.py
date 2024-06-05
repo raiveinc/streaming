@@ -12,10 +12,10 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from concurrent.futures._base import Future
 from enum import IntEnum
 from math import ceil
+from tempfile import gettempdir
 from threading import Event, Lock
 from time import sleep, time_ns
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple, Union
-from tempfile import gettempdir
 
 import numpy as np
 from filelock import FileLock
