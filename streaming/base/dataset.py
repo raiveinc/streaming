@@ -15,6 +15,7 @@ from math import ceil
 from threading import Event, Lock
 from time import sleep, time_ns
 from typing import Any, Dict, Iterator, Optional, Sequence, Tuple, Union
+from tempfile import gettempdir
 
 import numpy as np
 from filelock import FileLock
@@ -565,7 +566,7 @@ class StreamingDataset(Array, IterableDataset):
 
         self._shm_prefix_int, self._locals_shm = get_shm_prefix(streams_local, streams_remote,
                                                                 world)
-        self._filelock_root = os.path.join(os.path.sep, 'tmp', 'streaming')
+        self._filelock_root = os.path.join(gettempdir(), 'streaming')
         os.makedirs(self._filelock_root, exist_ok=True)
 
         # Create the shared memory-backed barrier, without its lock, which is unpickleable.
