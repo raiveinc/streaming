@@ -470,7 +470,6 @@ class StreamingDataset(Array, IterableDataset):
         self.master_stream_ids = np.zeros(self.num_master_streams, np.int64)
         stream_id = 0
         sample_offset = 0
-        shard_offset = 0
         for master_stream_id, master_stream in enumerate(streams):
             if isinstance(master_stream, ComposableStream):
                 grouped_stream = master_stream.list()
@@ -489,17 +488,16 @@ class StreamingDataset(Array, IterableDataset):
                     raise RuntimeError(f'Stream contains no samples: {index_filename}.')
                 self.streams.append(stream)
                 stream_per_shard += [stream_id] * len(stream_shards)
-                self.shard_offset_per_stream[stream_id] = shard_offset
+                self.shard_offset_per_stream[stream_id] = len(self.shards)
                 self.shards_per_stream[stream_id] = len(stream_shards)
                 self.samples_per_stream[stream_id] = num_stream_samples
                 self.shards += stream_shards
-                group_cum_sum = np.array(
-                    [sample_offset] + [shard.samples for shard in stream_shards],
-                    np.int64).cumsum()[:-1]
+                group_cum_sum = np.array([sample_offset] +
+                                         [shard.samples for shard in stream_shards],
+                                         np.int64).cumsum()[:-1]
                 self.sample_offset_per_shard += group_cum_sum.tolist()
 
                 self.stream_per_shard = np.array(stream_per_shard, np.int64)
-                shard_offset += self.shard_offset_per_stream[stream_id]
 
                 stream_id += 1
 
@@ -888,7 +886,7 @@ class StreamingDataset(Array, IterableDataset):
         sample_ids = []
 
         # Get master stream ids
-        assert stream_id in self.master_stream_ids or stream_id is None, "Sampling stream not found in master streams."
+        assert stream_id in self.master_stream_ids or stream_id is None, 'Sampling stream not found in master streams.'
         resampling_streams = self.master_stream_ids if stream_id is None else [stream_id]
 
         # Iterate over each stream.
