@@ -885,10 +885,7 @@ class StreamingDataset(Array, IterableDataset):
         shuffle_units = []
         sample_ids = []
 
-        # Get master stream ids
-        assert stream_id in self.master_stream_ids or stream_id is None, 'Sampling stream not found in master streams.'
         resampling_streams = self.master_stream_ids if stream_id is None else [stream_id]
-
         # Iterate over each stream.
         for stream_id in resampling_streams:
             # stream's shard offset in list of all shards from all streams

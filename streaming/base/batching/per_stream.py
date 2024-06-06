@@ -52,6 +52,8 @@ def generate_work_per_stream_batching(dataset: StreamingDataset, world: World, e
     batch_size = dataset.batch_size or 1
 
     for stream_id, stream in enumerate(dataset.streams):
+        if stream_id not in dataset.master_stream_ids:
+            continue
         shuffle_units, small_per_big = dataset.resample_streams(epoch, stream_id)
         samples_in_stream = len(small_per_big)
         stream_partition = get_partitions(dataset.partition_algo, samples_in_stream,
