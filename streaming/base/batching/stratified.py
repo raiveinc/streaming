@@ -55,6 +55,8 @@ def generate_work_stratified_batching(dataset: StreamingDataset, world: World, e
     batch_portion_per_stream = []
     stream_proportions = []
     for stream_id, stream in enumerate(dataset.streams):
+        if stream_id not in dataset.master_stream_ids:
+            continue
         # find how many samples in each global batch are from each stream.
         batch_portion = int(stream.proportion * global_batch_size)
         stream_proportions.append(stream.proportion)
